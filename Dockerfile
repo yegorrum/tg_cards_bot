@@ -22,4 +22,4 @@ RUN apk add --no-cache ca-certificates
 
 EXPOSE 8080
 
-CMD ["./tg_cards_bot"]
+CMD ["./app/tg_cards_bot"]

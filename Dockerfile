@@ -16,6 +16,8 @@ FROM alpine:3.20
 
 WORKDIR /app
 
+RUN apk add --no-cache ca-certificates
+
 COPY --from=builder /app/tg_cards_bot .
 COPY --from=builder /app/migrations /app/migrations
 
@@ -23,4 +25,4 @@ RUN apk add --no-cache ca-certificates
 
 EXPOSE 8080
 
-CMD ["/app/tg_cards_bot"]
+ENTRYPOINT ["/app/tg_cards_bot"]

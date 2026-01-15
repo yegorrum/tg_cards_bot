@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -22,121 +23,175 @@ import (
 var db *pgxpool.Pool
 
 func main() {
-	dsn := os.Getenv("DATABASE_URL")
+	dsn := mustEnv("DATABASE_URL")
 	service.RunMigrations(dsn)
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-
-	webhookURL := os.Getenv("WEBHOOK_URL")
-	token := os.Getenv("BOT_TOKEN")
-
-	if token == "" || webhookURL == "" {
-		log.Fatal("TG_TOKEN or WEBHOOK_URL not set")
-	}
-
 	ctx := context.Background()
+	db = service.InitDB(dsn, ctx)
 
-	var err error
-	db, err = pgxpool.New(ctx, dsn)
-	if err != nil {
-		log.Fatal(err)
-	}
+	token := mustEnv("BOT_TOKEN")
+	mode := mustEnv("BOT_MODE")
 
 	bot, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("bot init error: %v", err)
 	}
 
-	bot.Debug = false
-	log.Printf("Authorized as %s", bot.Self.UserName)
+	log.Printf("bot authorized as %s", bot.Self.UserName)
 
-	// включаем webhook
+	ctxUpd, stop := signal.NotifyContext(
+		ctx,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
+	switch mode {
+	case "polling":
+		bot.Debug = true
+		runPolling(ctxUpd, bot)
+
+	case "webhook":
+		bot.Debug = false
+		runWebhook(ctxUpd, bot)
+
+	default:
+		log.Fatalf("unknown BOT_MODE: %s", mode)
+	}
+}
+
+func runPolling(ctx context.Context, bot *tgbotapi.BotAPI) {
+	log.Println("starting in polling mode")
+
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60
+
+	updates := bot.GetUpdatesChan(u)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("polling shutdown")
+			bot.StopReceivingUpdates()
+			return
+
+		case update := <-updates:
+			handleUpdate(bot, update)
+		}
+	}
+}
+
+func runWebhook(ctx context.Context, bot *tgbotapi.BotAPI) {
+	webhookURL := mustEnv("WEBHOOK_URL")
+	portStr := mustEnv("WEBHOOK_PORT")
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		log.Fatalf("invalid port: %v", err)
+	}
+
+	log.Println("starting in webhook mode")
+
 	wh, err := tgbotapi.NewWebhook(webhookURL)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("webhook error: %v", err)
 	}
 
 	if _, err := bot.Request(wh); err != nil {
-		log.Fatal(err)
+		log.Fatalf("set webhook error: %v", err)
 	}
-
-	info, _ := bot.GetWebhookInfo()
-	log.Printf("Webhook set to %s", info.URL)
 
 	updates := bot.ListenForWebhook("/webhook")
 
-	server := &http.Server{Addr: ":" + port}
-
-	// сигналы
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	server := &http.Server{
+		Addr:              ":" + portStr,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 
 	go func() {
-		log.Printf("HTTP server started on :%s", port)
+		log.Printf("http server listening on :%d", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("ListenAndServe error: %v", err)
+			log.Fatalf("http server error: %v", err)
 		}
 	}()
 
-	// обработка апдейтов
-	go func() {
-		for update := range updates {
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("webhook shutdown started")
+
+			// 1️⃣ удалить webhook у Telegram
+			if _, err := bot.Request(tgbotapi.DeleteWebhookConfig{}); err != nil {
+				log.Printf("delete webhook error: %v", err)
+			} else {
+				log.Println("webhook deleted")
+			}
+
+			// 2️⃣ аккуратно остановить HTTP
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = server.Shutdown(shutdownCtx)
+
+			return
+
+		case update := <-updates:
 			handleUpdate(bot, update)
 		}
-	}()
+	}
+}
 
-	<-stop
-	log.Println("Shutdown signal received")
+func mustEnv(key string) string {
+	val := os.Getenv(key)
+	if val == "" {
+		log.Fatalf("env %s is required", key)
+	}
+	return val
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+func handleUpdate(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 
-	// выключаем webhook
-	if _, err := bot.Request(tgbotapi.DeleteWebhookConfig{}); err != nil {
-		log.Printf("DeleteWebhook error: %v", err)
-	} else {
-		log.Println("Webhook disabled")
+	if update.CallbackQuery != nil {
+		data := update.CallbackQuery.Data
+		parts := strings.Split(data, ":")
+
+		switch parts[0] {
+
+		case "minus":
+			handleClickDecrease(bot, update, parts[1])
+		case "plus":
+			handleClickIncrease(bot, update, parts[1])
+		}
 	}
 
-	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("HTTP shutdown error: %v", err)
+	if update.Message != nil && update.Message.IsCommand() {
+		switch update.Message.Command() {
+
+		case "add":
+			handleAdd(bot, update)
+
+		case "players":
+			sendPlayers(bot, update.Message.Chat.ID)
+		}
+	} else if update.Message != nil && !update.Message.IsCommand() {
+		log.Printf(
+			"Message from %d: %s",
+			update.Message.Chat.ID,
+			update.Message.Text,
+		)
+
+		text := fmt.Sprint("Привет! Я получил твоё сообщение:", update.Message.Text)
+		msg := tgbotapi.NewMessage(
+			update.Message.Chat.ID,
+			text,
+		)
+
+		if _, err := bot.Send(msg); err != nil {
+			log.Printf("send error: %v", err)
+		}
+	} else if update.Message == nil {
+		return
 	}
 
-	log.Println("Bot stopped gracefully")
-
-	// u := tgbotapi.NewUpdate(0)
-	// u.Timeout = 60
-	// updates := bot.GetUpdatesChan(u)
-
-	// for update := range updates {
-
-	// 	if update.Message != nil && update.Message.IsCommand() {
-	// 		switch update.Message.Command() {
-
-	// 		case "add":
-	// 			handleAdd(bot, update)
-
-	// 		case "players":
-	// 			sendPlayers(bot, update.Message.Chat.ID)
-	// 		}
-	// 	}
-
-	// 	if update.CallbackQuery != nil {
-	// 		data := update.CallbackQuery.Data
-	// 		parts := strings.Split(data, ":")
-
-	// 		switch parts[0] {
-
-	// 		case "minus":
-	// 			handleClickDecrease(bot, update, parts[1])
-	// 		case "plus":
-	// 			handleClickIncrease(bot, update, parts[1])
-	// 		}
-	// 	}
-	// }
 }
 
 func handleAdd(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
@@ -256,44 +311,4 @@ func handleClickDecrease(bot *tgbotapi.BotAPI, update tgbotapi.Update, name stri
 
 	cb := tgbotapi.NewCallback(update.CallbackQuery.ID, "-1")
 	bot.Request(cb)
-}
-
-func handleUpdate(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
-
-	if update.Message != nil && update.Message.IsCommand() {
-		switch update.Message.Command() {
-
-		case "add":
-			handleAdd(bot, update)
-
-		case "players":
-			sendPlayers(bot, update.Message.Chat.ID)
-		}
-	}
-
-	if update.CallbackQuery != nil {
-		data := update.CallbackQuery.Data
-		parts := strings.Split(data, ":")
-
-		switch parts[0] {
-
-		case "minus":
-			handleClickDecrease(bot, update, parts[1])
-		case "plus":
-			handleClickIncrease(bot, update, parts[1])
-		}
-	}
-
-	log.Printf(
-		"Message from %d: %s",
-		update.Message.Chat.ID,
-		update.Message.Text,
-	)
-
-	msg := tgbotapi.NewMessage(
-		update.Message.Chat.ID,
-		"Привет! Я получил твоё сообщение 👍",
-	)
-
-	bot.Send(msg)
 }
